@@ -1,14 +1,14 @@
-// 编译命令：g++ -o receiver receiver.cpp
 #include <iostream>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
 #include <sys/stat.h>
+#include <vector>
 
-struct VisionData {
-    float cx;          // 圆心 x 坐标（像素）
-    float cy;          // 圆心 y 坐标
-    float confidence;  // 置信度 0~1
+struct BucketInfo {
+    unsigned char id;   // 桶编号 1,2,3
+    float cx;
+    float cy;
 };
 
 int main() {
@@ -24,22 +24,40 @@ int main() {
         perror("无法打开管道");
         return 1;
     }
-    std::cout << "已连接，开始接收圆心坐标\n" << std::endl;
+    std::cout << "已连接，开始接收数据（桶ID + 坐标）" << std::endl;
 
-    VisionData data;
     while (true) {
-        ssize_t n = read(fd, &data, sizeof(data));
-        if (n == sizeof(data)) {
-            printf("圆心: (%.1f, %.1f) 置信度: %.2f\n", data.cx, data.cy, data.confidence);
-            // 在这里添加你的控制逻辑
-        } else if (n == 0) {
-            std::cout << "视觉程序已关闭管道" << std::endl;
+        unsigned char count;
+        ssize_t n = read(fd, &count, 1);
+        if (n == 0) {
+            std::cout << "Python 端已关闭管道" << std::endl;
             break;
-        } else {
+        } else if (n < 0) {
             perror("读取错误");
             break;
         }
+
+        if (count == 0) {
+            std::cout << "None (未检测到桶)" << std::endl;
+        } else {
+            std::cout << "检测到 " << (int)count << " 个桶:" << std::endl;
+            for (int i = 0; i < count; i++) {
+                BucketInfo bucket;
+                // 读取1字节ID
+                n = read(fd, &bucket.id, 1);
+                if (n != 1) break;
+                // 读取cx, cy (2个float)
+                n = read(fd, &bucket.cx, sizeof(float));
+                if (n != sizeof(float)) break;
+                n = read(fd, &bucket.cy, sizeof(float));
+                if (n != sizeof(float)) break;
+
+                std::cout << "  桶" << (int)bucket.id << ": (" << bucket.cx << ", " << bucket.cy << ")" << std::endl;
+            }
+        }
+        std::cout << std::endl;
     }
+
     close(fd);
     return 0;
 }
