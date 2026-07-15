@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-侦察区 - 桶内颜色标示检测（多线程 + 颜色分割备选）
+侦察区 - 桶内颜色标示检测（多线程，使用通用桶模型 best.pt）
 - 采集线程：从 TCP 拉流
-- 推理线程：YOLO 检测桶，不足时用颜色分割补全；检测桶内颜色
-- 管道发送线程：发送结果到 C++（文本协议）
+- 推理线程：YOLO 检测桶 + 颜色分割补全；检测桶内颜色
+- 管道发送线程：发送结果到 C++（文本协议，可选）
 - 显示线程：实时显示画面
 - 保存纯净的标示图片（最清晰的一张）
 """
 
 import cv2
 import torch
-import struct
 import os
 import sys
 import time
@@ -21,18 +20,18 @@ import fcntl
 from datetime import datetime
 
 # ================== 用户配置 ==================
-MODEL_PATH = "/home/hy/yolo_test/best_scout.pt"   # 侦察区模型
+MODEL_PATH = "/home/hy/yolo_test/best.pt"        # 通用桶模型（与投放区相同）
 YOLOV5_REPO = "/home/hy/yolov5"
-PIPE_PATH = "/tmp/vision_pipe"                     # 管道（可与投放区共用，但建议独立）
+PIPE_PATH = "/tmp/vision_pipe"                   # 管道（可选）
 IMG_SIZE = 416
 CONF_THRESH = 0.6
-TARGET_CLASS = 0
+TARGET_CLASS = 0                                 # 桶类别
 
 STREAM_URL = "tcp://127.0.0.1:5000"
 
 USE_DISPLAY = True
 DISPLAY_FPS = 15
-ENABLE_PIPE = True                                 # 是否通过管道发送结果
+ENABLE_PIPE = True                               # 是否通过管道发送结果（可选）
 
 SAVE_DIR = "/home/hy/marker_captures"
 MARKER_MIN_AREA = 100
@@ -62,7 +61,7 @@ def get_color_name(h, s, v):
 # ---------- 全局队列 ----------
 raw_queue = queue.Queue(maxsize=1)
 disp_queue = queue.Queue(maxsize=1)
-pipe_queue = queue.Queue(maxsize=1)   # 存储待发送的字符串
+pipe_queue = queue.Queue(maxsize=1)
 
 running = True
 pipe_w = None
@@ -86,7 +85,7 @@ if not os.path.exists(MODEL_PATH):
     print(f"❌ 模型文件不存在: {MODEL_PATH}")
     sys.exit(1)
 
-print("正在加载侦察区模型...")
+print("正在加载模型（侦察区使用通用桶模型）...")
 try:
     model = torch.hub.load(YOLOV5_REPO, 'custom',
                            path=MODEL_PATH, source='local',
@@ -116,7 +115,6 @@ else:
 def find_buckets_by_color(frame):
     """通过颜色分割寻找白色圆桶（当YOLO漏检时使用）"""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    # 白色桶的范围（亮度高，饱和度低）
     lower_white = np.array([0, 0, 200])
     upper_white = np.array([180, 30, 255])
     mask = cv2.inRange(hsv, lower_white, upper_white)
@@ -133,7 +131,6 @@ def find_buckets_by_color(frame):
         if area < 500:
             continue
         (cx, cy), radius = cv2.minEnclosingCircle(cnt)
-        # 圆度检查
         circularity = 4 * np.pi * area / (cv2.arcLength(cnt, True) ** 2)
         if circularity > 0.6:
             buckets.append((int(cx), int(cy), int(radius)))
@@ -151,7 +148,6 @@ def detect_color_in_roi(roi):
             if cv2.contourArea(cnt) < MARKER_MIN_AREA:
                 continue
             x, y, w, h = cv2.boundingRect(cnt)
-            # 取区域中心小区域计算 RGB 均值，避免边缘干扰
             cy, cx = h//2, w//2
             size = 5
             center_roi = roi[max(0, cy-size):cy+size, max(0, cx-size):cx+size]
@@ -159,7 +155,6 @@ def detect_color_in_roi(roi):
                 center_roi = roi[y:y+h, x:x+w]
             mean_bgr = cv2.mean(center_roi)[:3]
             r, g, b = mean_bgr[2], mean_bgr[1], mean_bgr[0]
-            # 用 HSV 均值判断颜色名称
             mean_hsv = cv2.mean(cv2.cvtColor(roi[y:y+h, x:x+w], cv2.COLOR_BGR2HSV))[:3]
             color = get_color_name(mean_hsv[0], mean_hsv[1], mean_hsv[2])
             return {
@@ -205,7 +200,7 @@ def capture_worker():
 def inference_worker():
     global running
     print("推理线程已启动")
-    detected = [False] * 5          # 记录每个桶是否已检测到颜色
+    detected = [False] * 5          # 每个桶是否已检测到颜色
     best_sharpness = [0.0] * 5      # 每个桶的最佳清晰度
     best_images = [None] * 5        # 每个桶的最佳图片
     best_info = [None] * 5          # 每个桶的最佳颜色信息
@@ -232,13 +227,11 @@ def inference_worker():
 
         # ----- 3. 合并结果（去重） -----
         all_centers = []
-        # 先加入 YOLO 中心
         for box in yolo_boxes:
             x1, y1, x2, y2, conf = box
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
             all_centers.append((cx, cy, 'yolo', (x1, y1, x2, y2)))
-        # 加入颜色分割结果（去重）
         for cx, cy, radius in color_buckets:
             overlap = False
             for mx, my, _, _ in all_centers:
@@ -246,7 +239,6 @@ def inference_worker():
                     overlap = True
                     break
             if not overlap:
-                # 颜色分割没有框，用半径生成一个框
                 x1 = cx - radius
                 y1 = cy - radius
                 x2 = cx + radius
@@ -256,9 +248,8 @@ def inference_worker():
         # 按 x 坐标排序
         all_centers.sort(key=lambda p: p[0])
 
-        # ----- 4. 对每个桶检测颜色（只检测未检测到的桶） -----
+        # ----- 4. 对每个桶检测颜色 -----
         result_frame = frame.copy()
-        has_detection = False
         current_results = []   # 用于管道发送
 
         for idx, (cx, cy, src, bbox) in enumerate(all_centers):
@@ -279,27 +270,22 @@ def inference_worker():
             result = detect_color_in_roi(roi)
             if result:
                 sharpness = compute_sharpness(result['image'])
-                # 更新最佳图片（保留最清晰的）
                 if sharpness > best_sharpness[idx]:
                     best_sharpness[idx] = sharpness
                     best_images[idx] = result['image'].copy()
                     best_info[idx] = (result['color'], result['rgb'], idx+1)
-                    # 一旦检测到颜色，标记该桶已检测（但我们允许后续更清晰的图片覆盖，但不再重复输出）
-                    # 为了不重复输出，我们可以在最终保存时输出，这里我们先标记 detected
-                    if not detected[idx]:
-                        detected[idx] = True
-                        has_detection = True
-                        color, rgb, _ = best_info[idx]
-                        # 保存图片
-                        timestamp = datetime.now().strftime("%H%M%S_%f")[:-3]
-                        filename = f"{SAVE_DIR}/bucket_{idx+1}_{color}_{timestamp}.jpg"
-                        cv2.imwrite(filename, best_images[idx])
-                        print(f"\n✅ 桶{idx+1} 检测到颜色: {color}  (RGB: {rgb[0]:.0f}, {rgb[1]:.0f}, {rgb[2]:.0f})")
-                        print(f"📁 已保存纯净图片: {filename}")
-                        # 记录结果用于管道发送
-                        current_results.append((idx+1, color, rgb))
+                    # 标记已检测
+                    detected[idx] = True
+                    color, rgb, _ = best_info[idx]
+                    # 保存图片
+                    timestamp = datetime.now().strftime("%H%M%S_%f")[:-3]
+                    filename = f"{SAVE_DIR}/bucket_{idx+1}_{color}_{timestamp}.jpg"
+                    cv2.imwrite(filename, best_images[idx])
+                    print(f"\n✅ 桶{idx+1} 检测到颜色: {color}  (RGB: {rgb[0]:.0f}, {rgb[1]:.0f}, {rgb[2]:.0f})")
+                    print(f"📁 已保存纯净图片: {filename}")
+                    current_results.append((idx+1, color, rgb))
 
-                # 在画面上绘制桶框和颜色框
+                # 绘制
                 cv2.rectangle(result_frame, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
                 cv2.putText(result_frame, f"B{idx+1}", (x1i, y1i-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
                 if result:
@@ -308,27 +294,23 @@ def inference_worker():
                     cv2.putText(result_frame, result['color'], (x1i+bx, y1i+by-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
         # ----- 5. 如果没有任何检测，输出 None -----
-        if not has_detection and not any(detected):
+        if not current_results and not any(detected):
             print("None")
-            current_results.append(("None",))   # 用于管道发送
+            if ENABLE_PIPE:
+                pipe_queue.put("None\n")
 
         # ----- 6. 发送结果到管道 -----
-        if ENABLE_PIPE and pipe_w is not None:
-            msg = ""
-            if len(current_results) == 0:
-                msg = "None"
-            else:
-                # 构建消息，如 "桶1:红色(200,50,50);桶2:黄色(220,210,40)"
-                parts = []
-                for idx, color, rgb in current_results:
-                    parts.append(f"桶{idx}:{color}({rgb[0]:.0f},{rgb[1]:.0f},{rgb[2]:.0f})")
-                msg = ";".join(parts)
+        if ENABLE_PIPE and pipe_w is not None and current_results:
+            msg_parts = []
+            for idx, color, rgb in current_results:
+                msg_parts.append(f"桶{idx}:{color}({rgb[0]:.0f},{rgb[1]:.0f},{rgb[2]:.0f})")
+            msg = ";".join(msg_parts) + "\n"
             while not pipe_queue.empty():
                 try:
                     pipe_queue.get_nowait()
                 except queue.Empty:
                     break
-            pipe_queue.put(msg + "\n")
+            pipe_queue.put(msg)
 
         # ----- 7. 显示 -----
         if USE_DISPLAY:
@@ -371,14 +353,13 @@ def display_worker():
     print("显示线程已启动")
     cv2.namedWindow("Scout Detection", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Scout Detection", 960, 540)
-
     delay = 1.0 / DISPLAY_FPS
 
     while running:
         if not disp_queue.empty():
             frame = disp_queue.get()
             cv2.imshow("Scout Detection", frame)
-            if cv2.waitKey(1) == 27:   # ESC
+            if cv2.waitKey(1) == 27:
                 running = False
                 break
         else:
