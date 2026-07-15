@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-起降区 - H 标识检测（多线程文本协议版）
+起降区 - H 标识检测
 - 采集线程：从 TCP 拉流
 - 推理线程：YOLO 检测 H，计算中心坐标
 - 发送线程：通过管道发送文本消息 "None" 或 "cx,cy"
@@ -17,24 +17,23 @@ import threading
 import numpy as np
 import fcntl
 
-# ================== 用户配置 ==================
-MODEL_PATH = "/home/hy/yolo_test/best_h.pt"   # H 模型路径
+
+MODEL_PATH = "/home/hy/yolo_test/best_h.pt"   
 YOLOV5_REPO = "/home/hy/yolov5"
-PIPE_PATH = "/tmp/h_pipe"                     # H 专用管道
+PIPE_PATH = "/tmp/h_pipe"                     
 IMG_SIZE = 416
 CONF_THRESH = 0.6
-H_CLASS = 0                                   # H 在训练中的类别 ID
+H_CLASS = 0                                   
 
 STREAM_URL = "tcp://127.0.0.1:5000"
 
 USE_DISPLAY = True
 DISPLAY_FPS = 15
-# ==============================================
+
 
 raw_queue = queue.Queue(maxsize=1)
 disp_queue = queue.Queue(maxsize=1)
-pipe_queue = queue.Queue(maxsize=1)           # 存储待发送的字符串
-
+pipe_queue = queue.Queue(maxsize=1)           
 running = True
 pipe_w = None
 
